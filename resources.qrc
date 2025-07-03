@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/plugins/upravljalec_elaborata" >
+        <file>icon.png</file>
+    </qresource>
+</RCC>
