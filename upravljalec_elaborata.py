@@ -360,8 +360,12 @@ class UpravjalecElaborata:
         self.move_layer_to_group(vlayer)
         self.set_polygons_style(vlayer)
 
-    def reconstruct_ring(self, parcelaId, daljica_ids, sharedDaljice, daljice_map, tocka_map, parceleDaljice_map):
+    def reconstruct_ring(self, parcelaId, daljica_ids, sharedDaljice, daljice_map, tocka_map, parceleDaljice_map, isStavba=False):
         coords = []
+
+        name = "parcelaEid"
+        if isStavba:
+            name = "stavbaParcelaEid"
 
         if len(daljica_ids) == 0:
             return coords
@@ -369,9 +373,15 @@ class UpravjalecElaborata:
         prevDaljica = None
 
         cDaljica = daljica_ids[0]
+        if isStavba:
+            print("cDaljica:", cDaljica)
         daljica_entries = parceleDaljice_map.get(str(cDaljica), [])
-        cParcelaDaljica = next((pd for pd in daljica_entries if str(pd["parcelaEid"]) == parcelaId), None)
-        parcela_id = str(cParcelaDaljica.get("parcelaEid", None))
+        if isStavba:
+            print("daljica_entries:", daljica_entries)
+        cParcelaDaljica = next((pd for pd in daljica_entries if str(pd[name]) == parcelaId), None)
+        if isStavba:
+            print("cParcelaDaljica:", cParcelaDaljica)
+        parcela_id = str(cParcelaDaljica.get(name, None))
         tockaEid = str(cParcelaDaljica.get("tockaEid", None))
         zacTockaEid = daljice_map.get(cDaljica, (None, None))[0]
         konTockaEid = daljice_map.get(cDaljica, (None, None))[1]
@@ -389,8 +399,8 @@ class UpravjalecElaborata:
                 if cDaljica != otherDaljica_id and otherDaljica_id in daljica_ids:
                     cDaljica = otherDaljica_id
                     daljica_entries = parceleDaljice_map.get(str(cDaljica), [])
-                    cParcelaDaljica = next((pd for pd in daljica_entries if str(pd["parcelaEid"]) == parcelaId), None)
-                    parcela_id = str(cParcelaDaljica.get("parcelaEid", None))
+                    cParcelaDaljica = next((pd for pd in daljica_entries if str(pd[name]) == parcelaId), None)
+                    parcela_id = str(cParcelaDaljica.get(name, None))
                     tockaEid = str(cParcelaDaljica.get("tockaEid", None))
                     zacTockaEid = daljice_map.get(cDaljica, (None, None))[0]
                     konTockaEid = daljice_map.get(cDaljica, (None, None))[1]
@@ -449,10 +459,12 @@ class UpravjalecElaborata:
         pr = vlayer.dataProvider()
         pr.addAttributes([
             QgsField("stavbaEid", QVariant.String),
-            QgsField("sprememba", QVariant.String),
-            QgsField("notUsingDaljice", QVariant.Bool)
+            QgsField("stavbaParcelaEid", QVariant.String),
+            QgsField("usingDaljice", QVariant.Bool)
         ])
         vlayer.updateFields()
+
+        daljice_map = {str(d["daljicaEid"]): (str(d["tockaEidZac"]), str(d["tockaEidKon"])) for d in daljice if d.get("sprememba") in ("N", "S", "D")}
 
         stavbe_map = {str(s["stavbaEid"]): s for s in stavbe if s.get("sprememba") in {"N", "D", "S"}}
         stavbe_parcele_map = defaultdict(list)
@@ -463,70 +475,92 @@ class UpravjalecElaborata:
                 print(f"Stavba {sp['stavbaEid']} ni najdena v seznamu stavb.")
                 continue
             stavbe_parcele_map[str(sp["stavbaEid"])].append(str(sp["stavbaParcelaEid"]))
+
         stavbe_parcele_daljice_map = defaultdict(list)
-        vrsta_povezave_map = {str(sp["stavbaParcelaEid"]): int(sp.get("vrstaPovezave", 4)) for sp in stavbeParcele if sp.get("sprememba") in {"N", "S", "D"}}
+        parcela2daljice_holes = defaultdict(lambda: defaultdict(list))
+        sharedDaljice = defaultdict(list)
+        stavbe_parcele_daljice_map_obj = defaultdict(list)
         for spd in stavbeParceleDaljice:
             if spd.get("sprememba") not in ("N", "S", "D"):
                 continue
-            stavbe_parcele_daljice_map[str(spd["stavbaParcelaEid"])].append(str(spd["daljicaEid"]))
 
+            parcela_id = str(spd["stavbaParcelaEid"])
+            daljica_id = str(spd["daljicaEid"])
+            pripadnost = spd.get("pripadnost", 0)
+            zacTockaEid = daljice_map.get(daljica_id, (None, None))[0]
+            konTockaEid = daljice_map.get(daljica_id, (None, None))[1]
+            if zacTockaEid is None or konTockaEid is None:
+                print(f"Daljica preskočena (manjka točka): {daljica_id}")
+                continue
+            sharedDaljice[parcela_id + zacTockaEid].append(spd)
+            sharedDaljice[parcela_id + konTockaEid].append(spd)
+            
+            stavbe_parcele_daljice_map_obj[daljica_id].append(spd)
+
+            if pripadnost == 0:
+                stavbe_parcele_daljice_map[parcela_id].append(daljica_id)
+            else:
+                parcela2daljice_holes[parcela_id][str(pripadnost)].append(daljica_id)            
+        
         #daljice_map = {str(d["daljicaEid"]): (str(d.get("tockaEidZac")), str(d.get("tockaEidKon"))) for d in daljice if d.get("sprememba") in {"N", "S", "D"}}
-        tocke_map = {str(t["tockaEid"]): (t["e"], t["n"]) for t in tocke if t.get("sprememba") in {"N", "S", "D"}}
+        tocka_map = {str(t["tockaEid"]): (t["e"], t["n"]) for t in tocke if t.get("sprememba") in {"N", "S", "D"}}
 
         features = []
         for stavba_id, stavbe_info in stavbe_map.items():
-            coords = []
-            notUsingDaljice = True
-            vrstaPovezave = 4
+            drawn = False
             for spd in stavbe_parcele_map.get(stavba_id, []):
-                vrstaPovezave = vrsta_povezave_map.get(spd, 4)
-                if vrstaPovezave == 4:
-                    notUsingDaljice = False
-                for daljica_id in stavbe_parcele_daljice_map.get(spd, []):
-                    spd_entry = next(
-                        (item for item in stavbeParceleDaljice if str(item["stavbaParcelaEid"]) == spd and str(item["daljicaEid"]) == daljica_id),
-                        None
-                    )
-                    if not spd_entry:
-                        continue
-                    tocka_eid = str(spd_entry.get("tockaEid"))
-                    coord = tocke_map.get(tocka_eid)
-                    if not coord:
-                        continue
-                    coords.append(QgsPointXY(coord[0], coord[1]))
-            geom = None
-            print("len coords:", len(coords), "notUsingDaljice:", notUsingDaljice)
-            if coords and len(coords) >= 3 and notUsingDaljice:
-                # Zapri poligon, če ni že zaprt
-                if coords[0] != coords[-1]:
-                    coords.append(coords[0])
-                geom = QgsGeometry.fromPolygonXY([coords])
-            else:
-                # Fallback: uporabi nadzemniGeom, če obstaja
-                nadzemni_geom = None
-                if vrstaPovezave == 2:
-                    nadzemni_geom = stavbe_info.get("tlorisGeom")
-                else:
-                    nadzemni_geom = stavbe_info.get("nadzemniGeom")    
-                if nadzemni_geom:
+
+                stavba_parcela_id = spd
+                daljice_ids = stavbe_parcele_daljice_map.get(stavba_parcela_id, [])  
+                outer_coords = self.reconstruct_ring(stavba_parcela_id, daljice_ids, sharedDaljice, daljice_map, tocka_map, stavbe_parcele_daljice_map_obj, isStavba=True)    
+                if len(outer_coords) < 3:
+                    print(f"Stavba parcela {stavba_parcela_id} nima dovolj koordinat za risanje.")
+                    continue
+
+                holes = []
+                for hole_ids in parcela2daljice_holes[stavba_parcela_id].values():
+                    hole_coords = self.reconstruct_ring(stavba_parcela_id, hole_ids, sharedDaljice, daljice_map, tocka_map, stavbe_parcele_daljice_map_obj, isStavba=True)
+                    if len(hole_coords) >= 3:
+                        holes.append(hole_coords)
+
+                feat = QgsFeature()
+                feat.setGeometry(QgsGeometry.fromPolygonXY([outer_coords] + holes))
+
+                drawn = True
+
+                feat.setAttributes([
+                    str(stavbe_info.get("stavbaEid")),  # stavbaEid
+                    stavba_parcela_id,  # stavbaParcelaEid)
+                    drawn
+                ])
+                features.append(feat)
+
+            if not drawn:
+                geom = None
+                for tryGeom in ("tlorisGeom", "nadzemniGeom", "podzemniGeom", "terenGeom"):
+                    if stavbe_info.get(tryGeom):
+                        geom = stavbe_info.get(tryGeom)
+                        break  
+                if geom:
                     try:
-                        geom = QgsGeometry.fromWkt(nadzemni_geom)
-                        notUsingDaljice = False
-                        print(f"  Uporabljam nadzemniGeom za stavba_id: {stavba_id}")
+                        geom = QgsGeometry.fromWkt(geom)
+                        drawn = True
+                        feat = QgsFeature()
+                        feat.setGeometry(geom)
+                        feat.setAttributes([
+                            str(stavbe_info.get("stavbaEid")),
+                            None,
+                            False
+                        ])
+                        features.append(feat)
+                        print(f"  Uporabljam geom za stavba_id: {stavba_id}")
                     except Exception as e:
-                        print(f"  Napaka pri branju nadzemniGeom za stavba_id {stavba_id}: {e}")
-            if not geom or (geom and geom.isEmpty()):
+                        print(f"  Napaka pri branju geom za stavba_id {stavba_id}: {e}")
+
+            if not drawn:
                 print(f"Stavba parcela {stavba_id} nima veljavnih koordinat ali geometrije.")
                 continue
-            feat = QgsFeature()
-            feat.setGeometry(geom)
-            feat.setAttributes([
-                str(stavbe_info.get("stavbaEid")),  # stavbaEid
-                stavbe_info.get("sprememba"),        # sprememba
-                notUsingDaljice
-            ])
-            features.append(feat)
-                              
+                
         if not features:
             QMessageBox.warning(self.dockwidget, "Napaka", "Ni najdenih veljavnih stavb.")
             return
@@ -707,16 +741,17 @@ class UpravjalecElaborata:
             stavbeParcele = self.last_stavbe_json["stavbeParcele"]
             stavbeParceleDaljice = self.last_stavbe_json["stavbeParceleDaljice"]
             daljice = self.last_stavbe_json["daljice"]
-            tocke = self.last_stavbe_json["tocke"]
 
             vlayer = QgsVectorLayer("Polygon?crs=EPSG:3794", "Stavbe iz XML", "memory")
             pr = vlayer.dataProvider()
             pr.addAttributes([
                 QgsField("stavbaEid", QVariant.String),
-                QgsField("sprememba", QVariant.String),
-                QgsField("notUsingDaljice", QVariant.Bool)
+                QgsField("stavbaParcelaEid", QVariant.String),
+                QgsField("usingDaljice", QVariant.Bool)
             ])
             vlayer.updateFields()
+
+            daljice_map = {str(d["daljicaEid"]): (str(d["tockaEidZac"]), str(d["tockaEidKon"])) for d in daljice if d.get("sprememba") in ("N", "S", "D")}
 
             stavbe_map = {str(s["stavbaEid"]): s for s in stavbe if s.get("sprememba") in {"N", "D", "S"}}
             stavbe_parcele_map = defaultdict(list)
@@ -724,55 +759,95 @@ class UpravjalecElaborata:
                 if (sp.get("sprememba") not in ("N", "S", "D")):
                     continue
                 if str(sp["stavbaEid"]) not in stavbe_map:
+                    print(f"Stavba {sp['stavbaEid']} ni najdena v seznamu stavb.")
                     continue
                 stavbe_parcele_map[str(sp["stavbaEid"])].append(str(sp["stavbaParcelaEid"]))
+
             stavbe_parcele_daljice_map = defaultdict(list)
+            parcela2daljice_holes = defaultdict(lambda: defaultdict(list))
+            sharedDaljice = defaultdict(list)
+            stavbe_parcele_daljice_map_obj = defaultdict(list)
             for spd in stavbeParceleDaljice:
                 if spd.get("sprememba") not in ("N", "S", "D"):
                     continue
-                stavbe_parcele_daljice_map[str(spd["stavbaParcelaEid"])].append(str(spd["daljicaEid"]))
 
+                parcela_id = str(spd["stavbaParcelaEid"])
+                daljica_id = str(spd["daljicaEid"])
+                pripadnost = spd.get("pripadnost", 0)
+                zacTockaEid = daljice_map.get(daljica_id, (None, None))[0]
+                konTockaEid = daljice_map.get(daljica_id, (None, None))[1]
+                if zacTockaEid is None or konTockaEid is None:
+                    print(f"Daljica preskočena (manjka točka): {daljica_id}")
+                    continue
+                sharedDaljice[parcela_id + zacTockaEid].append(spd)
+                sharedDaljice[parcela_id + konTockaEid].append(spd)
+                
+                stavbe_parcele_daljice_map_obj[daljica_id].append(spd)
+
+                if pripadnost == 0:
+                    stavbe_parcele_daljice_map[parcela_id].append(daljica_id)
+                else:
+                    parcela2daljice_holes[parcela_id][str(pripadnost)].append(daljica_id)            
+            
             features = []
             for stavba_id, stavbe_info in stavbe_map.items():
-                coords = []
+                drawn = False
                 for spd in stavbe_parcele_map.get(stavba_id, []):
-                    for daljica_id in stavbe_parcele_daljice_map.get(spd, []):
-                        spd_entry = next(
-                            (item for item in stavbeParceleDaljice if str(item["stavbaParcelaEid"]) == spd and str(item["daljicaEid"]) == daljica_id),
-                            None
-                        )
-                        if not spd_entry:
-                            continue
-                        tocka_eid = str(spd_entry.get("tockaEid"))
-                        coord = tocka_map.get(tocka_eid)
-                        if not coord:
-                            continue
-                        coords.append(QgsPointXY(coord[0], coord[1]))
-                geom = None
-                notUsingDaljice = True
-                if coords and len(coords) >= 3:
-                    if coords[0] != coords[-1]:
-                        coords.append(coords[0])
-                    geom = QgsGeometry.fromPolygonXY([coords])
-                else:
-                    nadzemni_geom = stavbe_info.get("nadzemniGeom")
-                    if nadzemni_geom:
-                        try:
-                            geom = QgsGeometry.fromWkt(nadzemni_geom)
-                            notUsingDaljice = False
-                        except Exception:
-                            pass
-                if not geom or (geom and geom.isEmpty()):
-                    continue
-                feat = QgsFeature()
-                feat.setGeometry(geom)
-                feat.setAttributes([
-                    str(stavbe_info.get("stavbaEid")),
-                    stavbe_info.get("sprememba"),
-                    notUsingDaljice
-                ])
-                features.append(feat)
 
+                    stavba_parcela_id = spd
+                    daljice_ids = stavbe_parcele_daljice_map.get(stavba_parcela_id, [])  
+                    outer_coords = self.reconstruct_ring(stavba_parcela_id, daljice_ids, sharedDaljice, daljice_map, tocka_map, stavbe_parcele_daljice_map_obj, isStavba=True)    
+                    if len(outer_coords) < 3:
+                        print(f"Stavba parcela {stavba_parcela_id} nima dovolj koordinat za risanje.")
+                        continue
+
+                    holes = []
+                    for hole_ids in parcela2daljice_holes[stavba_parcela_id].values():
+                        hole_coords = self.reconstruct_ring(stavba_parcela_id, hole_ids, sharedDaljice, daljice_map, tocka_map, stavbe_parcele_daljice_map_obj, isStavba=True)
+                        if len(hole_coords) >= 3:
+                            holes.append(hole_coords)
+
+                    feat = QgsFeature()
+                    feat.setGeometry(QgsGeometry.fromPolygonXY([outer_coords] + holes))
+
+                    drawn = True
+
+                    feat.setAttributes([
+                        str(stavbe_info.get("stavbaEid")),  # stavbaEid
+                        stavba_parcela_id,  # stavbaParcelaEid)
+                        drawn
+                    ])
+                    features.append(feat)
+
+                if not drawn:
+                    geom = None
+                    for tryGeom in ("tlorisGeom", "nadzemniGeom", "podzemniGeom", "terenGeom"):
+                        if stavbe_info.get(tryGeom):
+                            geom = stavbe_info.get(tryGeom)
+                            break  
+                    if geom:
+                        try:
+                            geom = QgsGeometry.fromWkt(geom)
+                            drawn = True
+                            feat = QgsFeature()
+                            feat.setGeometry(geom)
+                            feat.setAttributes([
+                                str(stavbe_info.get("stavbaEid")),
+                                None,
+                                False
+                            ])
+                            features.append(feat)
+                            print(f"  Uporabljam geom za stavba_id: {stavba_id}")
+                        except Exception as e:
+                            print(f"  Napaka pri branju geom za stavba_id {stavba_id}: {e}")
+
+                if not drawn:
+                    print(f"Stavba parcela {stavba_id} nima veljavnih koordinat ali geometrije.")
+                    continue
+                    
+            if not features:
+                QMessageBox.warning(self.dockwidget, "Napaka", "Ni najdenih veljavnih stavb.")
+                return
             pr.addFeatures(features)
             vlayer.updateExtents()
             QgsProject.instance().addMapLayer(vlayer)
