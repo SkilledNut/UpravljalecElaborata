@@ -29,7 +29,7 @@ import xml.etree.ElementTree as ET
 import json
 from qgis.core import QgsVectorLayer, QgsField, QgsFeature, QgsPointXY, QgsGeometry, QgsProject, QgsSimpleMarkerSymbolLayer, QgsSymbol, QgsSimpleLineSymbolLayer, QgsSimpleFillSymbolLayer, QgsRasterLayer, QgsCoordinateReferenceSystem, QgsRendererCategory, QgsCategorizedSymbolRenderer, QgsProperty, QgsSingleSymbolRenderer, QgsSymbolLayer, QgsFeatureRequest, QgsLayerTreeNode
 from PyQt5.QtCore import QVariant
-from collections import defaultdict
+from collections import defaultdict, deque
 import random
 import colorsys
 import base64
@@ -278,11 +278,17 @@ class UpravjalecElaborata:
         json_str = datoteka_elem.text
         podatki = json.loads(json_str)
         tocke = podatki.get("podatki", {}).get("tocke", [])
+        daljice = podatki.get("podatki", {}).get("daljice", [])
         parcele = podatki.get("podatki", {}).get("parcele", [])
         parceleDaljice = podatki.get("podatki", {}).get("parceleDaljice", [])
 
         # Slovar za hiter dostop do koordinat
         tocka_map = {str(t["tockaEid"]): (t["e"], t["n"]) for t in tocke if t.get("sprememba") in ("N", "S", "D")}
+        daljice_map = {str(d["daljicaEid"]): (str(d["tockaEidZac"]), str(d["tockaEidKon"])) for d in daljice if d.get("sprememba") in ("N", "S", "D")}
+        parceleDaljice_map = defaultdict(list)
+        for p in parceleDaljice:
+            if p.get("sprememba") in ("N", "S", "D"):
+                parceleDaljice_map[str(p["daljicaEid"])].append(p)
 
         # Pripravi sloj
         vlayer = QgsVectorLayer("Polygon?crs=EPSG:3794", "Parcele iz XML", "memory")
@@ -301,15 +307,24 @@ class UpravjalecElaborata:
 
         parcela2daljice_outer = defaultdict(list)
         parcela2daljice_holes = defaultdict(lambda: defaultdict(list))
+        sharedDaljice = defaultdict(list)
         for pd in parceleDaljice:
+            if pd.get("sprememba") not in ("N", "S", "D"):
+                continue
             parcela_id = str(pd["parcelaEid"])
             pripadnost = pd.get("pripadnost", 0)
-            tocka_id = str(pd["tockaEid"])
+            daljica_id = str(pd["daljicaEid"])
+            zacTockaEid = daljice_map.get(daljica_id, (None, None))[0]
+            konTockaEid = daljice_map.get(daljica_id, (None, None))[1]
+            if zacTockaEid is None or konTockaEid is None:
+                print(f"Daljica preskočena (manjka točka): {daljica_id}")
+                continue
+            sharedDaljice[parcela_id + zacTockaEid].append(pd)
+            sharedDaljice[parcela_id + konTockaEid].append(pd)
             if pripadnost == 0:
-                parcela2daljice_outer[parcela_id].append(tocka_id)
+                parcela2daljice_outer[parcela_id].append(daljica_id)
             else:
-                # pripadnost is the ID of the inner parcel (hole)
-                parcela2daljice_holes[parcela_id][str(pripadnost)].append(tocka_id)
+                parcela2daljice_holes[parcela_id][str(pripadnost)].append(daljica_id)
 
         features = []
         for parcela in parcele:
@@ -317,19 +332,15 @@ class UpravjalecElaborata:
                 continue
             parcela_id = str(parcela["parcelaEid"])
             # Outer ring
-            outer_ids = parcela2daljice_outer.get(parcela_id, [])
-            outer_coords = [QgsPointXY(*tocka_map[eid]) for eid in outer_ids if eid in tocka_map]
-            if outer_coords and outer_coords[0] != outer_coords[-1]:
-                outer_coords.append(outer_coords[0])
+            daljica_ids = parcela2daljice_outer.get(parcela_id, [])
+            outer_coords = self.reconstruct_ring(parcela_id, daljica_ids, sharedDaljice, daljice_map, tocka_map, parceleDaljice_map)
             if len(outer_coords) < 3:
                 continue
 
             # Holes (inner rings)
             holes = []
             for hole_ids in parcela2daljice_holes[parcela_id].values():
-                hole_coords = [QgsPointXY(*tocka_map[eid]) for eid in hole_ids if eid in tocka_map]
-                if hole_coords and hole_coords[0] != hole_coords[-1]:
-                    hole_coords.append(hole_coords[0])
+                hole_coords = self.reconstruct_ring(parcela_id, hole_ids, sharedDaljice, daljice_map, tocka_map, parceleDaljice_map)
                 if len(hole_coords) >= 3:
                     holes.append(hole_coords)
 
@@ -348,6 +359,49 @@ class UpravjalecElaborata:
         QgsProject.instance().addMapLayer(vlayer)
         self.move_layer_to_group(vlayer)
         self.set_polygons_style(vlayer)
+
+    def reconstruct_ring(self, parcelaId, daljica_ids, sharedDaljice, daljice_map, tocka_map, parceleDaljice_map):
+        coords = []
+
+        if len(daljica_ids) == 0:
+            return coords
+        
+        prevDaljica = None
+
+        cDaljica = daljica_ids[0]
+        daljica_entries = parceleDaljice_map.get(str(cDaljica), [])
+        cParcelaDaljica = next((pd for pd in daljica_entries if str(pd["parcelaEid"]) == parcelaId), None)
+        parcela_id = str(cParcelaDaljica.get("parcelaEid", None))
+        tockaEid = str(cParcelaDaljica.get("tockaEid", None))
+        zacTockaEid = daljice_map.get(cDaljica, (None, None))[0]
+        konTockaEid = daljice_map.get(cDaljica, (None, None))[1]
+        if tockaEid != konTockaEid:
+            temp = zacTockaEid
+            zacTockaEid = konTockaEid
+            konTockaEid = temp    
+        coords.append(QgsPointXY(tocka_map.get(zacTockaEid, (None, None))[0], tocka_map.get(zacTockaEid, (None, None))[1]))
+
+        while len(coords) == 1 and cDaljica != prevDaljica or coords[0] != coords[-1]:
+            prevDaljica = cDaljica
+            shared = sharedDaljice.get(parcela_id + tockaEid, [])
+            for pd in shared:
+                otherDaljica_id = str(pd.get("daljicaEid"))
+                if cDaljica != otherDaljica_id and otherDaljica_id in daljica_ids:
+                    cDaljica = otherDaljica_id
+                    daljica_entries = parceleDaljice_map.get(str(cDaljica), [])
+                    cParcelaDaljica = next((pd for pd in daljica_entries if str(pd["parcelaEid"]) == parcelaId), None)
+                    parcela_id = str(cParcelaDaljica.get("parcelaEid", None))
+                    tockaEid = str(cParcelaDaljica.get("tockaEid", None))
+                    zacTockaEid = daljice_map.get(cDaljica, (None, None))[0]
+                    konTockaEid = daljice_map.get(cDaljica, (None, None))[1]
+                    if tockaEid != konTockaEid:
+                        temp = zacTockaEid
+                        zacTockaEid = konTockaEid
+                        konTockaEid = temp    
+                    coords.append(QgsPointXY(tocka_map.get(zacTockaEid, (None, None))[0], tocka_map.get(zacTockaEid, (None, None))[1]))
+                    break 
+
+        return coords        
 
     def prikazi_stavbe_iz_xml(self, root):
         # Poišči <datoteka> znotraj <stavbe>
@@ -396,7 +450,7 @@ class UpravjalecElaborata:
         pr.addAttributes([
             QgsField("stavbaEid", QVariant.String),
             QgsField("sprememba", QVariant.String),
-            QgsField("usingDaljice", QVariant.Bool)
+            QgsField("notUsingDaljice", QVariant.Bool)
         ])
         vlayer.updateFields()
 
@@ -410,6 +464,7 @@ class UpravjalecElaborata:
                 continue
             stavbe_parcele_map[str(sp["stavbaEid"])].append(str(sp["stavbaParcelaEid"]))
         stavbe_parcele_daljice_map = defaultdict(list)
+        vrsta_povezave_map = {str(sp["stavbaParcelaEid"]): int(sp.get("vrstaPovezave", 4)) for sp in stavbeParcele if sp.get("sprememba") in {"N", "S", "D"}}
         for spd in stavbeParceleDaljice:
             if spd.get("sprememba") not in ("N", "S", "D"):
                 continue
@@ -421,39 +476,42 @@ class UpravjalecElaborata:
         features = []
         for stavba_id, stavbe_info in stavbe_map.items():
             coords = []
-            print(f"Obdelujem stavba_id: {stavba_id}")
+            notUsingDaljice = True
+            vrstaPovezave = 4
             for spd in stavbe_parcele_map.get(stavba_id, []):
-                print(f"  Parcela (stavbaParcelaEid): {spd}")
+                vrstaPovezave = vrsta_povezave_map.get(spd, 4)
+                if vrstaPovezave == 4:
+                    notUsingDaljice = False
                 for daljica_id in stavbe_parcele_daljice_map.get(spd, []):
-                    print(f"    Daljica: {daljica_id}")
                     spd_entry = next(
                         (item for item in stavbeParceleDaljice if str(item["stavbaParcelaEid"]) == spd and str(item["daljicaEid"]) == daljica_id),
                         None
                     )
                     if not spd_entry:
-                        print(f"      Ni najdenega stavbeParceleDaljice za {spd}, {daljica_id}")
                         continue
                     tocka_eid = str(spd_entry.get("tockaEid"))
                     coord = tocke_map.get(tocka_eid)
                     if not coord:
-                        print(f"      Točka {tocka_eid} ni najdena v seznamu točk.")
                         continue
                     coords.append(QgsPointXY(coord[0], coord[1]))
-            print(f"  Najdene koordinate: {len(coords)}")
             geom = None
-            usingDaljice = True
-            if coords and len(coords) >= 3:
+            print("len coords:", len(coords), "notUsingDaljice:", notUsingDaljice)
+            if coords and len(coords) >= 3 and notUsingDaljice:
                 # Zapri poligon, če ni že zaprt
                 if coords[0] != coords[-1]:
                     coords.append(coords[0])
                 geom = QgsGeometry.fromPolygonXY([coords])
             else:
                 # Fallback: uporabi nadzemniGeom, če obstaja
-                nadzemni_geom = stavbe_info.get("nadzemniGeom")
+                nadzemni_geom = None
+                if vrstaPovezave == 2:
+                    nadzemni_geom = stavbe_info.get("tlorisGeom")
+                else:
+                    nadzemni_geom = stavbe_info.get("nadzemniGeom")    
                 if nadzemni_geom:
                     try:
                         geom = QgsGeometry.fromWkt(nadzemni_geom)
-                        usingDaljice = False
+                        notUsingDaljice = False
                         print(f"  Uporabljam nadzemniGeom za stavba_id: {stavba_id}")
                     except Exception as e:
                         print(f"  Napaka pri branju nadzemniGeom za stavba_id {stavba_id}: {e}")
@@ -465,7 +523,7 @@ class UpravjalecElaborata:
             feat.setAttributes([
                 str(stavbe_info.get("stavbaEid")),  # stavbaEid
                 stavbe_info.get("sprememba"),        # sprememba
-                usingDaljice
+                notUsingDaljice
             ])
             features.append(feat)
                               
@@ -547,7 +605,13 @@ class UpravjalecElaborata:
         # Recreate polygons (parcele)
         parcele = self.last_json.get("podatki", {}).get("parcele", [])
         parceleDaljice = self.last_json.get("podatki", {}).get("parceleDaljice", [])
-        daljica_map = {str(d["daljicaEid"]): d for d in daljice}
+
+        # Slovar za hiter dostop do koordinat
+        daljice_map = {str(d["daljicaEid"]): (str(d["tockaEidZac"]), str(d["tockaEidKon"])) for d in daljice if d.get("sprememba") in ("N", "S", "D")}
+        parceleDaljice_map = defaultdict(list)
+        for p in parceleDaljice:
+            if p.get("sprememba") in ("N", "S", "D"):
+                parceleDaljice_map[str(p["daljicaEid"])].append(p)
 
         parcela2daljice = defaultdict(list)
         for pd in parceleDaljice:
@@ -576,15 +640,24 @@ class UpravjalecElaborata:
 
         parcela2daljice_outer = defaultdict(list)
         parcela2daljice_holes = defaultdict(lambda: defaultdict(list))
+        sharedDaljice = defaultdict(list)
         for pd in parceleDaljice:
+            if pd.get("sprememba") not in ("N", "S", "D"):
+                continue
             parcela_id = str(pd["parcelaEid"])
             pripadnost = pd.get("pripadnost", 0)
-            tocka_id = str(pd["tockaEid"])
+            daljica_id = str(pd["daljicaEid"])
+            zacTockaEid = daljice_map.get(daljica_id, (None, None))[0]
+            konTockaEid = daljice_map.get(daljica_id, (None, None))[1]
+            if zacTockaEid is None or konTockaEid is None:
+                print(f"Daljica preskočena (manjka točka): {daljica_id}")
+                continue
+            sharedDaljice[parcela_id + zacTockaEid].append(pd)
+            sharedDaljice[parcela_id + konTockaEid].append(pd)
             if pripadnost == 0:
-                parcela2daljice_outer[parcela_id].append(tocka_id)
+                parcela2daljice_outer[parcela_id].append(daljica_id)
             else:
-                # pripadnost is the ID of the inner parcel (hole)
-                parcela2daljice_holes[parcela_id][str(pripadnost)].append(tocka_id)
+                parcela2daljice_holes[parcela_id][str(pripadnost)].append(daljica_id)
 
         features = []
         for parcela in parcele:
@@ -592,30 +665,26 @@ class UpravjalecElaborata:
                 continue
             parcela_id = str(parcela["parcelaEid"])
             # Outer ring
-            outer_ids = parcela2daljice_outer.get(parcela_id, [])
-            outer_coords = [QgsPointXY(tocka_map[eid][0], tocka_map[eid][1]) for eid in outer_ids if eid in tocka_map]            
-            if outer_coords and outer_coords[0] != outer_coords[-1]:
-                outer_coords.append(outer_coords[0])
+            daljica_ids = parcela2daljice_outer.get(parcela_id, [])
+            outer_coords = self.reconstruct_ring(parcela_id, daljica_ids, sharedDaljice, daljice_map, tocka_map, parceleDaljice_map)
             if len(outer_coords) < 3:
                 continue
 
             # Holes (inner rings)
             holes = []
             for hole_ids in parcela2daljice_holes[parcela_id].values():
-                hole_coords = [QgsPointXY(tocka_map[eid][0], tocka_map[eid][1]) for eid in hole_ids if eid in tocka_map]                
-                if hole_coords and hole_coords[0] != hole_coords[-1]:
-                    hole_coords.append(hole_coords[0])
+                hole_coords = self.reconstruct_ring(parcela_id, hole_ids, sharedDaljice, daljice_map, tocka_map, parceleDaljice_map)
                 if len(hole_coords) >= 3:
                     holes.append(hole_coords)
 
-            hue = old_hues.get(parcela_id, random.random())
+            oldHue = old_hues.get(parcela_id, random.random())
             feat = QgsFeature()
             feat.setGeometry(QgsGeometry.fromPolygonXY([outer_coords] + holes))
             feat.setAttributes([
                 parcela_id,
                 parcela.get("stevilkaParcele", ""),
                 parcela.get("povrsina", None),
-                hue
+                oldHue
             ])
             features.append(feat)
 
@@ -640,15 +709,12 @@ class UpravjalecElaborata:
             daljice = self.last_stavbe_json["daljice"]
             tocke = self.last_stavbe_json["tocke"]
 
-            # Build tocke_map from current points layer (already done above)
-            # tocka_map = {...}
-
             vlayer = QgsVectorLayer("Polygon?crs=EPSG:3794", "Stavbe iz XML", "memory")
             pr = vlayer.dataProvider()
             pr.addAttributes([
                 QgsField("stavbaEid", QVariant.String),
                 QgsField("sprememba", QVariant.String),
-                QgsField("usingDaljice", QVariant.Bool)
+                QgsField("notUsingDaljice", QVariant.Bool)
             ])
             vlayer.updateFields()
 
@@ -665,8 +731,6 @@ class UpravjalecElaborata:
                 if spd.get("sprememba") not in ("N", "S", "D"):
                     continue
                 stavbe_parcele_daljice_map[str(spd["stavbaParcelaEid"])].append(str(spd["daljicaEid"]))
-
-            # tocke_map is already built above
 
             features = []
             for stavba_id, stavbe_info in stavbe_map.items():
@@ -685,7 +749,7 @@ class UpravjalecElaborata:
                             continue
                         coords.append(QgsPointXY(coord[0], coord[1]))
                 geom = None
-                usingDaljice = True
+                notUsingDaljice = True
                 if coords and len(coords) >= 3:
                     if coords[0] != coords[-1]:
                         coords.append(coords[0])
@@ -695,7 +759,7 @@ class UpravjalecElaborata:
                     if nadzemni_geom:
                         try:
                             geom = QgsGeometry.fromWkt(nadzemni_geom)
-                            usingDaljice = False
+                            notUsingDaljice = False
                         except Exception:
                             pass
                 if not geom or (geom and geom.isEmpty()):
@@ -705,7 +769,7 @@ class UpravjalecElaborata:
                 feat.setAttributes([
                     str(stavbe_info.get("stavbaEid")),
                     stavbe_info.get("sprememba"),
-                    usingDaljice
+                    notUsingDaljice
                 ])
                 features.append(feat)
 
@@ -956,7 +1020,8 @@ class UpravjalecElaborata:
             self.iface.addDockWidget(Qt.RightDockWidgetArea, self.dockwidget)
             self.dockwidget.show()
 
-            # povežemo gumb
+            # Set project CRS to EPSG:3912
+            crs = QgsCoordinateReferenceSystem("EPSG:3794")
             self.dockwidget.pushButton_loadXml.clicked.connect(self.nalozi_xml)
 
             # Set project CRS to EPSG:3912
